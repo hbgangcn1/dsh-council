@@ -1,0 +1,7 @@
+# dsh-council 构建/编辑产物忽略规则
+# 本地 file: 插件：源码即交付物，无需构建
+*.bak
+*.bak-*
+*.tmp
+*.log
+node_modules/
