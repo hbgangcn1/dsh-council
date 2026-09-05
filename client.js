@@ -154,6 +154,7 @@ window.__ModuleLoader__.load({
       const s = props.state || {}
       const bal = (s.balance && s.balance.ok) || {}
       const fx = s.fx || {}
+      const jd = s.judgeDrift || {}
       const runs = s.runs || []
       const latest = runs.find(function (r) { return r && r.result }) || null
       const circuit = s.circuit || {}
@@ -169,12 +170,26 @@ window.__ModuleLoader__.load({
             React.createElement("span", { className: "v ccl-num" }, bal["deepseek-official:balance"] != null ? "¥" + fmt(bal["deepseek-official:balance"], 2) : "--")),
           React.createElement("div", { className: "ccl-kv" },
             React.createElement("span", { className: "k" }, "MiniMax 5h 窗口"),
-            React.createElement("span", { className: "v ccl-num" }, bal["minimax-cn:5h"] != null ? fmt(bal["minimax-cn:5h"] * 100, 0) + "%" : "--")),
+            React.createElement("span", { className: "v ccl-num" }, bal["minimax-cn:5h"] != null ? fmt(bal["minimax-cn:5h"], 0) + "%" : "--")),
           React.createElement("div", { className: "ccl-kv" },
             React.createElement("span", { className: "k" }, "USD/CNY 汇率"),
             React.createElement("span", { className: "v ccl-num" }, fx.usdToCny || "--")),
           React.createElement("div", { className: "ccl-hint" },
             "汇率发布 " + (fx.publishDate || "--") + (fx.stale ? "（已过期，待 9:30 更新）" : ""))),
+        React.createElement("div", { className: "ccl-card" },
+          React.createElement("div", { className: "ccl-title" }, "Judge 漂移"),
+          jd.drift == null
+            ? React.createElement("div", { className: "ccl-empty" }, "暂无自评数据")
+            : React.createElement(React.Fragment, null,
+              React.createElement("div", { className: "ccl-kv" },
+                React.createElement("span", { className: "k" }, "状态"),
+                React.createElement("span", { className: "ccl-badge " + (jd.alerted ? "warn" : "ok") },
+                  jd.alerted ? "漂移告警" : "正常")),
+              React.createElement("div", { className: "ccl-kv" },
+                React.createElement("span", { className: "k" }, "总漂移"),
+                React.createElement("span", { className: "v ccl-num" }, fmt(jd.drift, 2))),
+              React.createElement("div", { className: "ccl-hint" },
+                "自评 " + String(jd.generatedAt || "--").slice(0, 10)))),
         React.createElement("div", { className: "ccl-card" },
           React.createElement("div", { className: "ccl-title" }, "模型池"),
           React.createElement("div", { className: "ccl-kv" },

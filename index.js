@@ -250,6 +250,31 @@ export default {
       if (res.exitCode === 2) return '成本对账告警（非失败）：' + driftTxt
       return '成本对账达标：' + driftTxt
     }
+    function b64(s) { return Buffer.from(String(s), 'utf8').toString('base64') }
+    async function notifyDriftAlert(body) {
+      // 漂移告警是“任务成功里的坏消息”：任务面板显示 done，不弹 toast 用户永远看不到。
+      // 通知本身绝不能抛错（try/catch 就地吞），否则会把夜间链拖下水。
+      try {
+        const sp = ctx.get('sandboxPolicy')
+        let policy
+        if (sp !== undefined) {
+          const base = sp.resolve()
+          policy = { mode: 'danger-full-access', workspaceRoot: base.workspaceRoot }
+        }
+        const spec = shell.resolve({
+          command: [
+            '$ErrorActionPreference = "SilentlyContinue"',
+            'Import-Module BurntToast',
+            '$t = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("' + b64('Council 漂移告警') + '"))',
+            '$b = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("' + b64(body) + '"))',
+            'New-BurntToastNotification -Text $t,$b',
+          ].join('; '),
+          timeoutMs: 8000,
+          sandboxPolicy: policy,
+        })
+        await shell.run(spec)
+      } catch (e) { /* 通知失败忽略 */ }
+    }
     async function jobNightly() {
       const parts = []
       // 1) judge 漂移自评
@@ -262,7 +287,9 @@ export default {
         throw new Error('judge 漂移自评退出码 ' + jd.exitCode + (jdTail ? '；尾部：\n' + jdTail : ''))
       }
       if (jd.exitCode === 2) {
-        return '夜间链停止：judge 漂移告警（退出 2），按手册不断链跑 apply；尾部：' + jdTail.split('\n').slice(-3).join(' / ')
+        const stopMsg = '夜间链停止：judge 漂移告警（退出 2），按手册不断链跑 apply；尾部：' + jdTail.split('\n').slice(-3).join(' / ')
+        await notifyDriftAlert(stopMsg)
+        return stopMsg
       }
       parts.push('judge 自评干净')
       // 2) 体检通过自动 apply（退出码恒 0，看 JSON 的 applied/reason）
@@ -777,7 +804,7 @@ export default {
 
         if (method === 'GET' && (op === 'state' || op === '')) {
           const freshBal = await fetchBalance(false)
-          const [caps, pricing, fx, runs, circuit, drift, staleness, hits, fbSize] = await Promise.all([
+          const [caps, pricing, fx, runs, circuit, drift, staleness, hits, fbSize, jd] = await Promise.all([
             readJson(join(COUNCIL_DIR, 'capabilities.json')),
             readJson(join(COUNCIL_DIR, 'pricing-profiles.json')),
             readJson(join(COUNCIL_DIR, 'exchange-rates.json')),
@@ -787,6 +814,7 @@ export default {
             computeStaleness(),
             guardrailHits24h(),
             countLines(join(COUNCIL_DIR, 'evals', 'runtime-feedback.jsonl')),
+            readJson(join(COUNCIL_DIR, 'judge-drift.json')),
           ])
           return sendJson(res, 200, {
             caps, pricing, fx, runs, circuit,
@@ -796,6 +824,7 @@ export default {
             costDrift: drift,
             guardrailHits24h: hits,
             feedbackRingSize: fbSize,
+            judgeDrift: jd,
           })
         }
 
