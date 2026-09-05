@@ -210,6 +210,17 @@ window.__ModuleLoader__.load({
       const s = props.state || {}
       const models = s.caps && s.caps.models ? s.caps.models : {}
       const [sel, setSel] = React.useState(null)
+      const [dsList, setDsList] = React.useState(null)
+      const [addBase, setAddBase] = React.useState("")
+      const [addMsg, setAddMsg] = React.useState("")
+      const [confirmRemove, setConfirmRemove] = React.useState(false)
+      // 各 provider 实际在用的 thinking 档位（按池中已有 18 条目归纳；未知 provider 回退全量六档）
+      const THINKINGS_BY_PROVIDER = {
+        "deepseek-official": ["off", "low", "high", "max"],
+        "minimax-cn": ["off", "minimal", "low", "medium", "high"],
+        "zai-coding-cn": ["minimal", "low", "medium", "high", "max"],
+      }
+      const ALL_THINKINGS = ["off", "minimal", "low", "medium", "high", "max"]
       const entries = Object.entries(models).sort(function (a, b) {
         return String(a[0]).localeCompare(String(b[0]))
       })
@@ -225,15 +236,75 @@ window.__ModuleLoader__.load({
           body: JSON.stringify({ capabilities: Object.assign({}, s.caps, { models: nextCaps }) }),
         }).then(function (r) { return r.json() }).then(function () { props.reload() })
       }
+      function loadDsModels() {
+        setDsList(null)
+        setAddMsg("")
+        fetch("/api/council/ds-models")
+          .then(function (r) { return r.json() })
+          .then(function (d) { setDsList(d && d.models ? d.models : []) })
+          .catch(function () { setDsList([]); setAddMsg("模型列表拉取失败") })
+      }
+      function baseInPool(base) {
+        return Object.keys(models).some(function (k) { return k === base || k.indexOf(base + "__") === 0 })
+      }
+      function addModel() {
+        if (!addBase) { setAddMsg("先选一个模型"); return }
+        const found = (dsList || []).filter(function (m) { return m && m.id === addBase })[0]
+        const provider = found ? found.provider : ""
+        // 档位优先用桥返回的该模型实际配置（ds-models.thinkings），拿不到才回退内置映射表
+        const levels = (found && Array.isArray(found.thinkings) && found.thinkings.length > 0)
+          ? found.thinkings
+          : (THINKINGS_BY_PROVIDER[provider] || ALL_THINKINGS)
+        const next = JSON.parse(JSON.stringify(models))
+        let added = 0
+        for (const lv of levels) {
+          const cid = addBase + "__" + lv
+          if (next[cid]) continue
+          next[cid] = {
+            baseModel: addBase, thinking: lv, provider: provider,
+            vendorGroup: String(provider || "").split("-")[0] || provider,
+            tier: /free|contributor/i.test(addBase) ? "T0-free" : "T1-pay-per-token",
+            stable: false, identityUnknown: true, capabilities: {},
+          }
+          added++
+        }
+        if (added === 0) { setAddMsg("该模型各档位都已在池中"); return }
+        setAddMsg("已加入 " + added + " 个档位：" + levels.join("、"))
+        save(next)
+      }
+      function removeModel(cid) {
+        if (Object.keys(models).length <= 1) { setAddMsg("池里只剩最后一个条目，不能删（档案要求 models 非空）"); return }
+        const next = JSON.parse(JSON.stringify(models))
+        delete next[cid]
+        if (sel === cid) setSel(null)
+        setConfirmRemove(false)
+        save(next)
+      }
       return React.createElement("div", { className: "ccl-row" },
         React.createElement("div", { style: { width: "300px", display: "flex", flexDirection: "column", gap: 4 } },
+          React.createElement("div", { className: "ccl-card", style: { marginBottom: 8 } },
+            React.createElement("div", { className: "ccl-title" }, "增加模型（DSH 已配置）"),
+            dsList === null
+              ? React.createElement("button", { className: "ccl-btn", onClick: loadDsModels }, "加载 DSH 模型列表")
+              : React.createElement(React.Fragment, null,
+                React.createElement("select", {
+                  className: "ccl-input", style: { width: "100%", marginBottom: 6 },
+                  value: addBase, onChange: function (e) { setAddBase(e.target.value) },
+                },
+                  React.createElement("option", { value: "" }, "选择模型…"),
+                  dsList.filter(function (m) { return m && m.id && !baseInPool(m.id) }).map(function (m) {
+                    return React.createElement("option", { key: m.provider + "/" + m.id, value: m.id }, m.id + "（" + m.provider + "）")
+                  })),
+                React.createElement("button", { className: "ccl-btn", onClick: addModel }, "一键加入全部档位"),
+                addMsg ? React.createElement("div", { className: "ccl-hint" }, addMsg) : null,
+                React.createElement("div", { className: "ccl-hint" }, "一次建该模型全部档位；新成员默认临时身份"))),
           entries.map(function (e) {
             const cid = e[0], m = e[1]
             const avg = m.capabilities ? Object.values(m.capabilities).filter(function (c) { return c && c.score != null }).reduce(function (a, c) { return a + c.score }, 0) / Math.max(1, Object.values(m.capabilities).filter(function (c) { return c && c.score != null }).length) : null
             return React.createElement("button", {
               key: cid, className: "ccl-tab" + (sel === cid ? " ccl-on" : ""),
               style: { textAlign: "left", borderBottom: "none" },
-              onClick: function () { setSel(cid) },
+              onClick: function () { setSel(cid); setConfirmRemove(false) },
             },
               React.createElement("span", { style: { display: "flex", justifyContent: "space-between", gap: 8 } },
                 React.createElement("span", {}, cid),
@@ -254,7 +325,11 @@ window.__ModuleLoader__.load({
               RadarSvg({ values: Object.fromEntries(Object.entries(selModel.capabilities || {}).map(function (e) { return [e[0], e[1] && e[1].score] })) }),
               React.createElement("div", { className: "ccl-row" },
                 React.createElement("button", { className: "ccl-btn", onClick: function () { toggleStable(sel) } },
-                  selModel.stable === false ? "标记为稳定成员" : "标记为临时成员"))),
+                  selModel.stable === false ? "标记为稳定成员" : "标记为临时成员"),
+                React.createElement("button", { className: "ccl-btn danger", onClick: function () {
+                  if (confirmRemove) removeModel(sel)
+                  else setConfirmRemove(true)
+                } }, confirmRemove ? "确认移除出池？" : "移除出池"))),
             React.createElement("div", { className: "ccl-card" },
               React.createElement("div", { className: "ccl-title" }, "维度分数"),
               React.createElement("table", { className: "ccl-table" },

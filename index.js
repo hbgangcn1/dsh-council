@@ -746,6 +746,35 @@ export default {
           return handleLlmStream(req, res)
         }
 
+        if (method === 'GET' && op === 'ds-models') {
+          // DSH 已配置模型一览（控制台“增加模型”下拉数据源）。
+          // 每项带 thinkings：该模型在 DSH 配置里实际支持的档位（resolveModelInfo 的
+          // reasoning.efforts）；拿不到的省略，客户端回退内置映射表。
+          const out = []
+          let providers = []
+          try { providers = ctx.llm.listConfigurableProviders() || [] } catch (e) { providers = [] }
+          for (const prov of providers) {
+            const pid = prov.provider || prov.id
+            if (!pid) continue
+            let models = []
+            try { models = await ctx.llm.listModels(pid) } catch (e) { continue }
+            for (const m of models || []) {
+              const id = m && String(m.id || m.model || m.name || '')
+              if (!id) continue
+              const entry = { id: id, provider: pid }
+              try {
+                const info = await ctx.llm.resolveModelInfo(pid, id)
+                const efforts = info && info.reasoning && Array.isArray(info.reasoning.efforts)
+                  ? info.reasoning.efforts.map(function (e) { return String((e && e.id) || e) }).filter(Boolean)
+                  : []
+                if (efforts.length > 0) entry.thinkings = efforts
+              } catch (e) { /* 拿不到就省略，客户端回退 */ }
+              out.push(entry)
+            }
+          }
+          return sendJson(res, 200, { models: out })
+        }
+
         if (method === 'GET' && (op === 'state' || op === '')) {
           const freshBal = await fetchBalance(false)
           const [caps, pricing, fx, runs, circuit, drift, staleness, hits, fbSize] = await Promise.all([
