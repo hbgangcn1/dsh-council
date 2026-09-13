@@ -15,7 +15,7 @@ import { mkdir, readFile, writeFile, readdir, stat, rename } from 'node:fs/promi
 // v15（2026-08-24 council 评审 H1-H4/M1-M4/L1-L3 落地，见 AGENTS.md 同期记录）
 export default {
   name: 'council',
-  inject: ['tools', 'webServer', 'shell', 'timer', 'credentials', 'llm'],
+  inject: ['tools', 'webServer', 'shell', 'timer', 'credentials', 'llm', 'web'],
   apply(ctx) {
     const shell = ctx.shell
     const COUNCIL_DIR = join(homedir(), '.dsh', 'council')
@@ -97,7 +97,9 @@ export default {
           if (!latest) throw new Error('council 运行完成但未找到 result.json（可能失败，检查 ' + COUNCIL_DIR + '\\runs\\）')
           const res = latest.result
           const lines = []
-          lines.push('【Council ' + tier + ' 档】状态：' + res.status + ' · 轮数：' + res.rounds + ' · S_r 轨迹：' + JSON.stringify(res.s_history))
+          // v15.7（2026-09-13）：抬头只留档位/轮数/状态。S_r 轨迹是过程量，
+          // 对读者无用（运行信息由 council_v14 追加到 report.md 末尾）。
+          lines.push('【Council ' + tier + ' 档】状态：' + res.status + ' · 轮数：' + res.rounds)
           if (mode === 'inline' && res.inline_text) {
             lines.push('')
             lines.push(res.inline_text)
@@ -179,17 +181,39 @@ export default {
     // 约定：只有真正的执行错误才 throw（任务失败→重试→阻塞升级）；
     // 熔断暂停/无内容空转/漂移告警/额度用尽一律返回 ok 文本说明，不触发失败路径。
     // 唯一例外（已确认）：--apply 被门禁拒绝且原因需人工（baseHash_mismatch/malformed）→ throw 走阻塞升级。
+    // python -m 模块模式（包内相对 import 需要包上下文）+ 工作目录锁定 council 根。
+    // 沙箱策略必须显式声明（2026-09-06 实测：不传 sandboxPolicy 时子进程写
+    // ~/.dsh/council/*.tmp 报 PermissionError，读正常——默认解析走了受限策略，
+    // 与调用会话的 danger-full-access 无关）。council python 只写自家数据目录，
+    // 用最小权限 workspace-write + root=COUNCIL_DIR（允许该目录 + 系统临时区）。
+    // 注意：不要在这里传自定义 env（同日实测 allowlist env 也会导致同类 EACCES）。
+    // cwd=COUNCIL_DIR 保证 import 解析到正确拷贝；污染环境的
+    // _editable_impl_model_council.pth 已删除，PYTHONPATH 为空。
     function pyMod(mod, args, timeoutMs) {
-      // python -m 模块模式（包内相对 import 需要包上下文）+ 工作目录锁定 council 根
       const argStr = (args && args.length)
         ? ' ' + args.map(function (a) { return '"' + String(a).replace(/"/g, '\\"') + '"' }).join(' ')
         : ''
-      return shell.resolve({ command: 'python -m ' + mod + argStr, workdir: COUNCIL_DIR, timeoutMs: timeoutMs })
+      return shell.resolve({ command: 'python -m ' + mod + argStr, workdir: COUNCIL_DIR, timeoutMs: timeoutMs, sandboxPolicy: { mode: 'workspace-write', workspaceRoot: COUNCIL_DIR } })
     }
     function shellTail(res, n) {
       const t = ((res && res.stdout && res.stdout.text) || '').trim()
       if (!t) return ''
       return t.split('\n').slice(-(n || 12)).join('\n')
+    }
+    // 2026-09-06 诊断教训：python 崩溃的 traceback 全在 stderr，只看 stdout 尾部
+    // 会得到“退出码 1 + 空尾部”的不可诊断错误。失败抛错必须带 stderr 尾部。
+    function shellErrTail(res, n) {
+      const t = ((res && res.stderr && res.stderr.text) || '').trim()
+      if (!t) return ''
+      return t.split('\n').slice(-(n || 12)).join('\n')
+    }
+    function exitDetail(res) {
+      const bits = []
+      const so = shellTail(res)
+      const se = shellErrTail(res)
+      if (so) bits.push('stdout 尾部：\n' + so)
+      if (se) bits.push('stderr 尾部：\n' + se)
+      return bits.length ? '；' + bits.join('\n') : ''
     }
     function tryParseJsonTail(text) {
       const t = String(text || '').trim()
@@ -213,7 +237,7 @@ export default {
     async function jobFx() {
       const res = await runPyChecked('orchestrator.fetch_exchange_rate', [], 180000)
       if (res.exitCode !== 0) {
-        throw new Error('汇率抓取退出码 ' + res.exitCode + (shellTail(res) ? '；尾部：\n' + shellTail(res) : ''))
+        throw new Error('汇率抓取退出码 ' + res.exitCode + exitDetail(res))
       }
       const fx = await readJson(join(COUNCIL_DIR, 'exchange-rates.json'))
       if (!fx || fx.usdToCny == null) throw new Error('抓取成功但 exchange-rates.json 无有效汇率')
@@ -224,23 +248,31 @@ export default {
       let st = null
       try { st = JSON.parse(await readFile(join(COUNCIL_DIR, 'auto-evolve-state.json'), 'utf8')) } catch (e) { st = null }
       if (st && st.paused) {
-        return '换题进化跳过：熔断暂停中（pausedReason=' + (st.pausedReason || '?') + '），按手册不强跑'
+        return 'auto_evolve 已暂停：换题进化熔断中（pausedReason=' + (st.pausedReason || '?') + '，consecutiveFailures=' + (st.consecutiveFailures != null ? st.consecutiveFailures : '?') + '），按手册不强跑'
       }
       const res = await runPyChecked('benchmark.auto_evolve', [], 1700000)
       if (res.exitCode !== 0) {
-        throw new Error('换题进化退出码 ' + res.exitCode + (shellTail(res) ? '；尾部：\n' + shellTail(res) : ''))
+        throw new Error('换题进化退出码 ' + res.exitCode + exitDetail(res))
       }
       const out = tryParseJsonTail(res.stdout && res.stdout.text)
       if (!out) return '换题进化完成（输出非 JSON，退出码 0）'
-      if (out.paused) return '换题进化跳过：熔断暂停中（' + (out.reason || out.note || '?') + '）'
+      if (out.paused) return 'auto_evolve 已暂停：换题进化熔断中（' + (out.reason || out.note || '?') + '）'
       if (out.action === 'noop') return '换题进化 noop：考卷无变化' + (out.note ? '（' + out.note + '）' : '')
       if (out.ok === false) throw new Error('换题进化失败：' + JSON.stringify(out).slice(0, 500))
       return '换题进化完成：action=' + (out.action || '?') + ' changed=' + JSON.stringify(out.changed != null ? out.changed : null)
     }
     async function jobReconcile() {
       const res = await runPyChecked('orchestrator.cost_calibrate', ['--check'], 180000)
+      // 2026-09-10 沙箱兼容：workspace-write 下 python exit(2) 疑被上报为 1
+      //（stdout 是完整告警 JSON 且无 stderr）。此时按 JSON 的 alerted 语义归一，
+      // 避免“告警”被误判成“失败”进阻塞。真失败（traceback/非 JSON）照样抛错。
       if (res.exitCode !== 0 && res.exitCode !== 2) {
-        throw new Error('成本对账退出码 ' + res.exitCode + (shellTail(res) ? '；尾部：\n' + shellTail(res) : ''))
+        const maybe = tryParseJsonTail(res.stdout && res.stdout.text)
+        const se = shellErrTail(res)
+        if (!(res.exitCode === 1 && maybe && maybe.alerted === true && !se)) {
+          throw new Error('成本对账退出码 ' + res.exitCode + exitDetail(res))
+        }
+        res.exitCode = 2
       }
       let drift = null
       try { drift = JSON.parse(await readFile(join(COUNCIL_DIR, 'cost-drift.json'), 'utf8')) } catch (e) { drift = null }
@@ -284,7 +316,15 @@ export default {
         return '夜间链跳过：judge 额度用尽（QUOTA_EXHAUSTED），按手册全跳过不重试'
       }
       if (jd.exitCode !== 0 && jd.exitCode !== 2) {
-        throw new Error('judge 漂移自评退出码 ' + jd.exitCode + (jdTail ? '；尾部：\n' + jdTail : ''))
+        // 2026-09-10 沙箱兼容：同 jobReconcile，exit(2) 疑被上报为 1。
+        // 仅当 stdout 是告警 JSON（alerted true）且无 stderr 时归一为 2；
+        // 异常路径的 {"error":...} 照样抛错。
+        const maybeJd = tryParseJsonTail(jd.stdout && jd.stdout.text)
+        const seJd = shellErrTail(jd)
+        if (!(jd.exitCode === 1 && maybeJd && maybeJd.alerted === true && !seJd)) {
+          throw new Error('judge 漂移自评退出码 ' + jd.exitCode + (jdTail ? '；尾部：\n' + jdTail : ''))
+        }
+        jd.exitCode = 2
       }
       if (jd.exitCode === 2) {
         const stopMsg = '夜间链停止：judge 漂移告警（退出 2），按手册不断链跑 apply；尾部：' + jdTail.split('\n').slice(-3).join(' / ')
@@ -304,6 +344,12 @@ export default {
         parts.push('落盘成功 revision=' + apOut.revision + ' 改分 ' + apOut.changedScores + ' 项')
       } else if (apOut.reason === 'no_pending_diff') {
         parts.push('落盘空转：无待落盘内容')
+      } else if (apOut.reason === 'judge_drift_pause_escalated') {
+        // 连续暂停超上限：自进化已冻死多日，需人工重建基线（--init-baseline）。
+        // 抛错走阻塞升级 + 先弹 toast（blocked 的上报是尽力而为，toast 保证可见）。
+        const escMsg = '夜间链升级：judge 漂移连续暂停 ' + (apOut.pauseStreak || '?') + ' 次已升级，自进化冻结，需人工重建基线'
+        await notifyDriftAlert(escMsg)
+        throw new Error('能力落盘被门禁拒绝：' + apOut.reason + '（' + escMsg + '）')
       } else {
         // judge_drift_paused / baseHash_mismatch / pending_diff_malformed → 需人工，抛错走阻塞升级
         throw new Error('能力落盘被门禁拒绝：' + apOut.reason + '（需人工介入，已升级阻塞）')
@@ -559,6 +605,13 @@ export default {
       const maxTokens = Number(body.max_tokens) || 4096
       const system = body.system ? String(body.system) : undefined
       const temperature = body.temperature != null ? Number(body.temperature) : 0
+      // v15.9：透传桥接会话 ID → ctx.llm.stream 的 sessionId → pi-ai 原生
+      // session 头（openai-responses 适配器发 session_id/x-client-request-id +
+      // prompt_cache_key）。OpenCode Zen 要求每会话稳定 session（缺则免费档
+      // 400 MissingSessionID）；主会话经 agent-loop 自带 DSH session id，
+      // council 经桥调用此前从不带，muse 全挂。Python 侧每进程一个稳定 id。
+      const sessionId = body.session_id ? String(body.session_id)
+        : (body.sessionId ? String(body.sessionId) : undefined)
 
       // v15.6：支持 messages 多轮调用（tool-use case）。prompt 和 messages 至少要有一个
       const hasMessages = Array.isArray(body.messages) && body.messages.length > 0
@@ -700,6 +753,7 @@ export default {
       }
       if (level) opts.reasoningEffort = level
       if (system) opts.system = system
+      if (sessionId) opts.sessionId = sessionId
       if (dshTools && dshTools.length > 0) opts.tools = dshTools
 
       try {
@@ -763,6 +817,74 @@ export default {
       }
     }
 
+    // v15.10 tool-exec：宿主只读工具执行（council tool loop 用）。
+    // 只放行 web_search/web_fetch（双边 allowlist，Python 侧同样校验），
+    // 经宿主 ctx.web 执行（与主会话同后端同 key，只读、无审批门）。
+    // ctx.get('web') 软拿：组合里没挂 web 服务时报 503，不炸插件树。
+    const TOOL_EXEC_ALLOW = { web_search: true, web_fetch: true }
+    function formatSearchResult(r) {
+      const lines = []
+      if (r && r.content) lines.push('提供方答案：' + String(r.content).slice(0, 2000))
+      const sources = (r && r.sources) || []
+      sources.forEach(function (s, i) {
+        const title = (s && (s.title || s.url)) || ('来源' + (i + 1))
+        lines.push('- [' + title + '](' + ((s && s.url) || '') + ')' +
+          (s && s.snippet ? ' —— ' + String(s.snippet).slice(0, 600) : '') +
+          (s && s.publishedAt ? '（' + s.publishedAt.slice(0, 10) + '）' : ''))
+      })
+      if (r && r.truncated) lines.push('（来源列表被截断）')
+      return lines.join('\n') || '(无结果)'
+    }
+    function formatFetchResult(r) {
+      if (!r) return '(抓取无结果)'
+      const body = (r.body && r.body.content) || ''
+      return '最终URL：' + (r.url || '') + '\n状态码：' + (r.statusCode || '') +
+        (r.truncated ? '（正文被截断）' : '') + '\n正文：\n' + String(body).slice(0, 12000)
+    }
+    async function handleToolExec(req, res) {
+      let body
+      try { body = await readBody(req) }
+      catch (e) { return sendJson(res, 400, { ok: false, error: 'invalid json body' }) }
+      const name = String((body && body.name) || '')
+      const args = (body && body.args && typeof body.args === 'object') ? body.args : {}
+      if (!TOOL_EXEC_ALLOW[name]) {
+        return sendJson(res, 403, { ok: false, error: 'tool not allowed: ' + (name || '(empty)') })
+      }
+      const web = ctx.get ? ctx.get('web') : undefined
+      if (!web) {
+        return sendJson(res, 503, { ok: false, error: 'web service unavailable' })
+      }
+      try {
+        if (name === 'web_search') {
+          const queries = Array.isArray(args.queries)
+            ? args.queries.map(function (q) { return String(q || '').trim() }).filter(Boolean).slice(0, 4)
+            : []
+          if (queries.length === 0) {
+            return sendJson(res, 400, { ok: false, error: 'web_search requires queries[1..4]' })
+          }
+          const maxResults = Math.max(1, Math.min(8, Number(args.maxResults) || 5))
+          const parts = []
+          for (const q of queries) {
+            const sig = (typeof AbortSignal !== 'undefined' && AbortSignal.timeout)
+              ? AbortSignal.timeout(45000) : undefined
+            const r = await web.search({ query: q, maxResults: maxResults }, sig)
+            parts.push('### 查询：' + q + '\n' + formatSearchResult(r))
+          }
+          return sendJson(res, 200, { ok: true, result: parts.join('\n\n').slice(0, 24000) })
+        }
+        const url = String(args.url || '')
+        if (!/^https?:\/\//i.test(url)) {
+          return sendJson(res, 400, { ok: false, error: 'web_fetch requires http(s) url' })
+        }
+        const sig = (typeof AbortSignal !== 'undefined' && AbortSignal.timeout)
+          ? AbortSignal.timeout(45000) : undefined
+        const r = await web.fetch({ url: url }, sig)
+        return sendJson(res, 200, { ok: true, result: formatFetchResult(r).slice(0, 24000) })
+      } catch (e) {
+        return sendJson(res, 502, { ok: false, error: 'tool-exec failed: ' + String((e && e.message) || e).slice(0, 300) })
+      }
+    }
+
     async function handleRequest(req, res) {
       try {
         const url = new URL(req.url || '/', 'http://x')
@@ -771,6 +893,13 @@ export default {
 
         if (method === 'POST' && op === 'llm-stream') {
           return handleLlmStream(req, res)
+        }
+
+        // v15.10：宿主工具执行（council tool loop 用）。只放行只读的
+        // web_search/web_fetch，经宿主 ctx.web 执行（与主会话同后端同 key，
+        // 只读、无审批门）。Python 侧同样有 allowlist，双边校验。
+        if (method === 'POST' && op === 'tool-exec') {
+          return handleToolExec(req, res)
         }
 
         if (method === 'GET' && op === 'ds-models') {
