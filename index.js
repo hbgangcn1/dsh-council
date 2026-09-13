@@ -77,9 +77,14 @@ export default {
           const tier = ['fast', 'standard', 'deep'].includes(args.tier) ? args.tier : 'standard'
           const mode = args.mode === 'inline' ? 'inline' : 'report'
           const timeoutMs = mode === 'inline' ? 300000 : 1800000
+          // 沙箱策略必须显式声明（2026-09-13 实测：run_council 这条路径漏传 sandboxPolicy，
+          // 子进程建 ~/.dsh/council/runs/<新目录> 报 WinError 5 拒绝访问；调用会话是
+          // danger-full-access 也不会传导）。council python 只写自家数据目录，用最小权限
+          // workspace-write + root=COUNCIL_DIR，与 pyMod（定时任务那条）保持一致。
           const spec = shell.resolve({
             command: py('council_v14.py', '--task', task, '--tier', tier, '--mode', mode),
             timeoutMs: timeoutMs,
+            sandboxPolicy: { mode: 'workspace-write', workspaceRoot: COUNCIL_DIR },
           })
           await runShellChecked(spec)
           // 读最新 run 的 result.json（不依赖 shell 返回结构）
@@ -981,6 +986,7 @@ export default {
           const spec = shell.resolve({
             command: py('council_v14.py', '--task', task, '--tier', tier, '--mode', mode),
             timeoutMs: mode === 'inline' ? 300000 : 1800000,
+            sandboxPolicy: { mode: 'workspace-write', workspaceRoot: COUNCIL_DIR },
           })
           try {
             await runShellChecked(spec)
