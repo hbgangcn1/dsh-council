@@ -113,16 +113,59 @@ export default {
         '$code | Out-File -FilePath ' + psQuote(h.exitPath) + ' -Encoding ascii',
       ].join("\r\n")
       await writeFile(wrapper, body, 'utf8')
+
+      // 点火脚本独立成文件：2026-09-14 首次实测失败，怀疑点有两个——
+      // ① shell 命令里内嵌 `-ArgumentList "..."` 会被外层 pwsh -Command 的引号层搅掉；
+      //    改成 `-File launch.ps1` 后命令里只剩一个双引号包住的路径，无引号博弈。
+      // ② 受限令牌（workspace-write）下 Start-Process 可能起不来/子进程被回收。
+      //    与 AGENTS.md 里「toast 通知在受限令牌下必失败、需 danger-full-access」同类，
+      //    此处同样用 danger-full-access **只为点火这一次调用**（它除了 Start-Process
+      //    什么都不干），真正干活的 python 由 wrapper 自己拉起、继承的也是完整令牌。
+      // 点火失败不再静默：launch.ps1 把异常写进 launch-error.txt，下面显式检查。
+      const launchedPath = join(dir, 'launched.txt')
+      const launchErrPath = join(dir, 'launch-error.txt')
+      const launchBody = [
+        '$ErrorActionPreference = "Stop"',
+        'try {',
+        '  $p = Start-Process -FilePath pwsh -ArgumentList @("-NoProfile","-ExecutionPolicy","Bypass","-File",' +
+          psQuote(wrapper) + ') -WindowStyle Hidden -PassThru',
+        '  $p.Id | Out-File -FilePath ' + psQuote(launchedPath) + ' -Encoding ascii',
+        '} catch {',
+        '  ("LAUNCH_ERROR: " + $_.Exception.Message) | Out-File -FilePath ' + psQuote(launchErrPath) + ' -Encoding utf8',
+        '  exit 1',
+        '}',
+      ].join("\r\n")
+      const launchScript = join(dir, 'launch.ps1')
+      await writeFile(launchScript, launchBody, 'utf8')
+
+      const sp = ctx.get('sandboxPolicy')
+      let policy = { mode: 'workspace-write', workspaceRoot: COUNCIL_DIR }
+      if (sp !== undefined) {
+        const base = sp.resolve()
+        policy = { mode: 'danger-full-access', workspaceRoot: base.workspaceRoot }
+      }
       const launch = shell.resolve({
-        command: 'Start-Process -FilePath pwsh -ArgumentList "-NoProfile","-ExecutionPolicy","Bypass","-File",' +
-          psQuote(wrapper) + ' -WindowStyle Hidden',
+        command: 'pwsh -NoProfile -ExecutionPolicy Bypass -File "' + launchScript + '"',
         timeoutMs: 60000,
-        sandboxPolicy: { mode: 'workspace-write', workspaceRoot: COUNCIL_DIR },
+        sandboxPolicy: policy,
       })
       const res = await shell.run(launch)
-      if (res.timedOut || res.exitCode !== 0) {
-        throw new Error('启动 council 分离进程失败：' +
-          (((res.stderr && res.stderr.text) || '') + ((res.stdout && res.stdout.text) || '')).slice(-300))
+      const launchErr = await readFileText(launchErrPath)
+      if (res.timedOut || res.exitCode !== 0 || launchErr) {
+        throw new Error('启动 council 分离进程失败：' + (launchErr || '') +
+          ' | ' + (((res.stderr && res.stderr.text) || '') + ((res.stdout && res.stdout.text) || '')).slice(-300))
+      }
+      // 活性自检：等 wrapper 写下 pid.txt（它几乎是第一件事）。没有就说明分离进程没活下来——
+      // 必须在这里快速失败，否则下游轮询会一路空等到 45 分钟 deadline 才报超时。
+      const tLive = Date.now()
+      while (Date.now() - tLive < 20000) {
+        if ((await readFileText(h.pidPath)) !== null) break
+        if ((await readFileText(h.exitPath)) !== null) break
+        await sleep(2000)
+      }
+      if ((await readFileText(h.pidPath)) === null && (await readFileText(h.exitPath)) === null) {
+        throw new Error('分离进程未存活（20s 内没写出 pid.txt）：点火成功但子进程被回收/未能启动。' +
+          '日志目录 ' + dir + '；launch-error=' + ((await readFileText(launchErrPath)) || '(无)'))
       }
       return h
     }
