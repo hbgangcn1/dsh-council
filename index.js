@@ -21,9 +21,16 @@ export default {
     const COUNCIL_DIR = join(homedir(), '.dsh', 'council')
     const ORCH = join(COUNCIL_DIR, 'orchestrator')
 
+    // v15.12c（2026-09-14 实测踩到）：原来用 `\"` 转义双引号——那是 C/JSON 的规矩，
+    // **PowerShell 不认**（PS 双引号字符串里 `\"` 会被当成字面反斜杠 + 结束引号）。
+    // 后果：任务文本里只要出现 ASCII 双引号，参数就被提前截断 → argparse 退出码 2。
+    // 之前几次任务用的都是中文引号「」，所以一直没暴露。
+    // 改用 PS 单引号字面量（内部单引号翻倍），双引号 / 反斜杠 / $ / 换行 全部安全。
+    function psArg(s) { return "'" + String(s).replace(/'/g, "''") + "'" }
+
     function py(script, ...args) {
-      const safe = args.map(function (a) { return '"' + String(a).replace(/"/g, '\\"') + '"' })
-      return 'python ' + JSON.stringify(join(ORCH, script)) + ' ' + safe.join(' ')
+      const safe = args.map(function (a) { return psArg(a) })
+      return 'python ' + psArg(join(ORCH, script)) + ' ' + safe.join(' ')
     }
 
     // M3：shell.run 只对基础设施失败 reject；非零退出码会 resolve，必须显式检查，
@@ -357,7 +364,7 @@ export default {
     // _editable_impl_model_council.pth 已删除，PYTHONPATH 为空。
     function pyModCmd(mod, args) {
       const argStr = (args && args.length)
-        ? ' ' + args.map(function (a) { return '"' + String(a).replace(/"/g, '\\"') + '"' }).join(' ')
+        ? ' ' + args.map(function (a) { return psArg(a) }).join(' ')
         : ''
       return 'python -m ' + mod + argStr
     }
