@@ -28,23 +28,29 @@ export default {
 
     // M3：shell.run 只对基础设施失败 reject；非零退出码会 resolve，必须显式检查，
     // 否则 python 崩溃时静默回退到旧 run 的 result.json（可观测性盲区）。
+    // 退出码/超时的统一校验（M3：shell.run 只对基础设施失败 reject；非零退出码会 resolve，
+    // 必须显式检查，否则 python 崩溃时静默回退到旧 run 的 result.json）。
+    function assertExitOk(res, label) {
+      const tail = function (s) {
+        const t = (s && s.text || '').trim()
+        return t ? t.split('\n').slice(-12).join('\n') : ''
+      }
+      const errTail = tail(res.stderr)
+      const outTail = tail(res.stdout)
+      if (res.exitCode !== 0) {
+        throw new Error(label + ' 退出码 ' + res.exitCode +
+          (errTail ? '；stderr 尾部：\n' + errTail : '') +
+          (outTail ? '；stdout 尾部：\n' + outTail : ''))
+      }
+      return res
+    }
+
     async function runShellChecked(spec) {
       const res = await shell.run(spec)
       if (res.timedOut) {
         throw new Error('council python 执行超时（timeoutMs=' + spec.timeoutMs + '，timedOut=true）')
       }
-      if (res.exitCode !== 0) {
-        const tail = function (s) {
-          const t = (s && s.text || '').trim()
-          return t ? t.split('\n').slice(-12).join('\n') : ''
-        }
-        const errTail = tail(res.stderr)
-        const outTail = tail(res.stdout)
-        throw new Error('council python 退出码 ' + res.exitCode +
-          (errTail ? '；stderr 尾部：\n' + errTail : '') +
-          (outTail ? '；stdout 尾部：\n' + outTail : ''))
-      }
-      return res
+      return assertExitOk(res, 'council python')
     }
 
     async function readJson(path) {
@@ -55,6 +61,120 @@ export default {
       const tmp = path + '.tmp'
       await writeFile(tmp, JSON.stringify(obj, null, 2) + '\n')
       await rename(tmp, path)
+    }
+
+    // ---- v15.12（2026-09-14 Robert 拍板 B 方案）：分离启动 + 轮询 ----
+    // 动因：`dsh-pwsh-local` 的配置默认值里 `maxTimeoutMs = 600000`，语义是
+    // 「每次调用 timeoutMs 覆盖值的上限」——它会**静默**把 shell.resolve 的 timeoutMs
+    // 钳到 600s。council 一次 run 实测 800–1900s（fast 档墙钟就 1320s），
+    // 所以走 shell 阻塞调用必被杀：2026-09-14 实测 fast 档 run 在 600s 报 timedOut
+    // 且不产出报告。宿主超时改多大都没用，因为天花板在这一层。
+    //
+    // 解法：把 python 以**分离进程**（Start-Process）启动，shell 调用只负责"点火"
+    // 并立刻返回（60s 足够），插件侧改成轮询文件系统等 result.json / 退出码文件。
+    // 附带收益：python 不再挂在 shell 调用生命周期上，DSH 重启也杀不掉正在跑的 run。
+    const DETACH_DIR = join(COUNCIL_DIR, 'scratch', 'detached')
+
+    function psQuote(s) { return "'" + String(s).replace(/'/g, "''") + "'" }
+
+    async function readFileText(p) {
+      try { return await readFile(p, 'utf8') } catch (e) { return null }
+    }
+
+    function sleep(ms) {
+      return new Promise(function (resolve) { ctx.setTimeout(resolve, ms) })
+    }
+
+    // 启动分离 python，返回句柄；不做等待
+    async function spawnDetached(command, workdir) {
+      const token = String(Date.now()) + '-' + Math.random().toString(36).slice(2, 8)
+      const dir = join(DETACH_DIR, token)
+      await mkdir(dir, { recursive: true })
+      const h = {
+        token: token, dir: dir,
+        stdoutPath: join(dir, 'stdout.txt'),
+        stderrPath: join(dir, 'stderr.txt'),
+        exitPath: join(dir, 'exit.txt'),
+        pidPath: join(dir, 'pid.txt'),
+      }
+      const wrapper = join(dir, 'run.ps1')
+      // 编码三件套必须有：PV7 下 [Console]::OutputEncoding 默认是系统 ANSI（中文机为 GBK），
+      // 不显式设 UTF-8 的话 python 打的中文 JSON 会被打成乱码、下游 parse 全废。
+      const body = [
+        '$ErrorActionPreference = "Continue"',
+        '$OutputEncoding = [System.Text.Encoding]::UTF8',
+        '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8',
+        '$env:PYTHONIOENCODING = "utf-8"',
+        '$PID | Out-File -FilePath ' + psQuote(h.pidPath) + ' -Encoding ascii',
+        'Set-Location -LiteralPath ' + psQuote(workdir),
+        '& ' + command + ' 2> ' + psQuote(h.stderrPath) +
+          ' | Out-File -FilePath ' + psQuote(h.stdoutPath) + ' -Encoding utf8',
+        '$code = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 1 }',
+        '$code | Out-File -FilePath ' + psQuote(h.exitPath) + ' -Encoding ascii',
+      ].join("\r\n")
+      await writeFile(wrapper, body, 'utf8')
+      const launch = shell.resolve({
+        command: 'Start-Process -FilePath pwsh -ArgumentList "-NoProfile","-ExecutionPolicy","Bypass","-File",' +
+          psQuote(wrapper) + ' -WindowStyle Hidden',
+        timeoutMs: 60000,
+        sandboxPolicy: { mode: 'workspace-write', workspaceRoot: COUNCIL_DIR },
+      })
+      const res = await shell.run(launch)
+      if (res.timedOut || res.exitCode !== 0) {
+        throw new Error('启动 council 分离进程失败：' +
+          (((res.stderr && res.stderr.text) || '') + ((res.stdout && res.stdout.text) || '')).slice(-300))
+      }
+      return h
+    }
+
+    // 轮询等待分离进程写出 exit.txt；超时则杀掉并标记 timedOut
+    async function waitDetached(h, deadlineMs) {
+      const t0 = Date.now()
+      while (true) {
+        const exitTxt = await readFileText(h.exitPath)
+        if (exitTxt !== null) {
+          const code = parseInt(String(exitTxt).trim(), 10)
+          return {
+            exitCode: isNaN(code) ? 1 : code,
+            stdout: { text: (await readFileText(h.stdoutPath)) || '' },
+            stderr: { text: (await readFileText(h.stderrPath)) || '' },
+            timedOut: false,
+            detachedDir: h.dir,
+          }
+        }
+        if (Date.now() - t0 > deadlineMs) {
+          try {
+            const pid = parseInt(String(await readFileText(h.pidPath) || '').trim(), 10)
+            if (!isNaN(pid)) {
+              await shell.run(shell.resolve({
+                command: 'Stop-Process -Id ' + pid + ' -Force -ErrorAction SilentlyContinue',
+                timeoutMs: 20000,
+                sandboxPolicy: { mode: 'workspace-write', workspaceRoot: COUNCIL_DIR },
+              }))
+            }
+          } catch (e) { /* 杀不掉就算了，下面照样报超时 */ }
+          return {
+            exitCode: 1,
+            stdout: { text: (await readFileText(h.stdoutPath)) || '' },
+            stderr: { text: '分离进程轮询超时（deadlineMs=' + deadlineMs + '）' },
+            timedOut: true,
+            detachedDir: h.dir,
+          }
+        }
+        await sleep(5000)
+      }
+    }
+
+    // 与 shell.run(spec) 同形（exitCode/stdout/stderr/timedOut），但不受 600s 钳制。
+    // 超时抛错；非零退出码原样返回，由调用方按语义分支（runPyChecked 的既有契约）。
+    async function runLongChecked(command, workdir, timeoutMs, label) {
+      const h = await spawnDetached(command, workdir)
+      const res = await waitDetached(h, timeoutMs)
+      if (res.timedOut) {
+        throw new Error(label + ' 执行超时（分离进程轮询 deadline=' + timeoutMs +
+          'ms；日志 ' + h.dir + '）')
+      }
+      return res
     }
 
     // ---- 工具：run_council ----
@@ -76,17 +196,15 @@ export default {
           if (!task) throw new Error('task 不能为空')
           const tier = ['fast', 'standard', 'deep'].includes(args.tier) ? args.tier : 'standard'
           const mode = args.mode === 'inline' ? 'inline' : 'report'
-          const timeoutMs = mode === 'inline' ? 300000 : 1800000
-          // 沙箱策略必须显式声明（2026-09-13 实测：run_council 这条路径漏传 sandboxPolicy，
-          // 子进程建 ~/.dsh/council/runs/<新目录> 报 WinError 5 拒绝访问；调用会话是
-          // danger-full-access 也不会传导）。council python 只写自家数据目录，用最小权限
-          // workspace-write + root=COUNCIL_DIR，与 pyMod（定时任务那条）保持一致。
-          const spec = shell.resolve({
-            command: py('council_v14.py', '--task', task, '--tier', tier, '--mode', mode),
-            timeoutMs: timeoutMs,
-            sandboxPolicy: { mode: 'workspace-write', workspaceRoot: COUNCIL_DIR },
-          })
-          await runShellChecked(spec)
+          // v15.12：timeoutMs 现在只是**轮询 deadline**，不再是 shell 调用超时——
+          // 因此不受 dsh-pwsh-local 的 maxTimeoutMs(600s) 钳制。python 自身有墙钟预算
+          // 自限（wallBudget + 综合落盘），这里留足余量。report/inline 走的是同一个
+          // 收敛循环、耗时相同，所以两者用同一 deadline（旧的 inline=300s 是错的）。
+          const timeoutMs = 2700000
+          const runRes = await runLongChecked(
+            py('council_v14.py', '--task', task, '--tier', tier, '--mode', mode),
+            COUNCIL_DIR, timeoutMs, 'council python')
+          assertExitOk(runRes, 'council python')
           // 读最新 run 的 result.json（不依赖 shell 返回结构）
           // 注意：目录名混用两种格式（20260506-192100 / 2026-08-24_02-01-00），
           // 字符串排序会把 20260506 排在 2026-08-24 前面 → 必须按 mtime 排序。
@@ -194,11 +312,11 @@ export default {
     // 注意：不要在这里传自定义 env（同日实测 allowlist env 也会导致同类 EACCES）。
     // cwd=COUNCIL_DIR 保证 import 解析到正确拷贝；污染环境的
     // _editable_impl_model_council.pth 已删除，PYTHONPATH 为空。
-    function pyMod(mod, args, timeoutMs) {
+    function pyModCmd(mod, args) {
       const argStr = (args && args.length)
         ? ' ' + args.map(function (a) { return '"' + String(a).replace(/"/g, '\\"') + '"' }).join(' ')
         : ''
-      return shell.resolve({ command: 'python -m ' + mod + argStr, workdir: COUNCIL_DIR, timeoutMs: timeoutMs, sandboxPolicy: { mode: 'workspace-write', workspaceRoot: COUNCIL_DIR } })
+      return 'python -m ' + mod + argStr
     }
     function shellTail(res, n) {
       const t = ((res && res.stdout && res.stdout.text) || '').trim()
@@ -233,11 +351,10 @@ export default {
     async function runPyChecked(mod, args, timeoutMs) {
       // runShellChecked 的变体：超时/基础设施失败照样 throw，
       // 非零退出码则原样返回，由调用方按手册语义分支（退出 2 等）
-      const res = await shell.run(pyMod(mod, args, timeoutMs))
-      if (res.timedOut) {
-        throw new Error('council_daily_job ' + mod + ' 执行超时（timeoutMs=' + timeoutMs + '）')
-      }
-      return res
+      // v15.12：改走分离启动 + 轮询——judge_drift(1560s)/auto_evolve(1700s) 这两个
+      // 夜间链任务原本会被 dsh-pwsh-local 的 maxTimeoutMs(600s) 静默钳死。
+      return await runLongChecked(pyModCmd(mod, args), COUNCIL_DIR, timeoutMs,
+                                  'council_daily_job ' + mod)
     }
     async function jobFx() {
       const res = await runPyChecked('orchestrator.fetch_exchange_rate', [], 180000)
@@ -983,13 +1100,11 @@ export default {
           const tier = ['fast', 'standard', 'deep'].includes(body.tier) ? body.tier : 'standard'
           const mode = body.mode === 'inline' ? 'inline' : 'report'
           if (!task) return sendJson(res, 400, { error: 'task required' })
-          const spec = shell.resolve({
-            command: py('council_v14.py', '--task', task, '--tier', tier, '--mode', mode),
-            timeoutMs: mode === 'inline' ? 300000 : 1800000,
-            sandboxPolicy: { mode: 'workspace-write', workspaceRoot: COUNCIL_DIR },
-          })
           try {
-            await runShellChecked(spec)
+            // v15.12：同 run_council 工具——走分离启动 + 轮询，绕开 600s 钳制
+            const hcmd = py('council_v14.py', '--task', task, '--tier', tier, '--mode', mode)
+            const hres = await runLongChecked(hcmd, COUNCIL_DIR, 2700000, 'council python')
+            assertExitOk(hres, 'council python')
             return sendJson(res, 200, { ok: true })
           } catch (e) {
             return sendJson(res, 500, { error: String(e && e.message ? e.message : e) })
@@ -1069,7 +1184,12 @@ export default {
       try {
         const bj = beijingNow()
         if (bj.hm >= '09:30' && bj.dateStr !== lastFxDate) {
-          const spec = shell.resolve({ command: py('fetch_exchange_rate.py'), timeoutMs: 60000 })
+          // v15.12（2026-09-13 修）：补 sandboxPolicy——与 run_council 同一类漏洞。
+          // 此前这里不传策略 → 子进程走受限令牌 → 写 ~/.dsh/council/*.tmp 报 EACCES，
+          // 又被下面的 catch 静默吞掉，所以汇率定时器长期「看起来没事」，实际靠
+          // task-panel 的 council_daily_job job=fx 兜底。
+          const spec = shell.resolve({ command: py('fetch_exchange_rate.py'), timeoutMs: 60000,
+            sandboxPolicy: { mode: 'workspace-write', workspaceRoot: COUNCIL_DIR } })
           await runShellChecked(spec)   // 失败会 throw：不记日期，下一轮（60s 后）自动重试
           lastFxDate = bj.dateStr
         }
