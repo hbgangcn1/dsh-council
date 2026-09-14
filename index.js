@@ -196,9 +196,15 @@ export default {
           try {
             const pid = parseInt(String(await readFileText(h.pidPath) || '').trim(), 10)
             if (!isNaN(pid)) {
+              // v15.14 修（2026-09-14 实测事故）：pid.txt 记的是 **wrapper pwsh** 的 PID，
+              // 真正的 python 是它的子进程。原先只 Stop-Process 父进程 → python 变孤儿
+              // 继续跑：插件 45 分钟以为超时放弃后，那个 run 又跑了一小时，还和随后
+              // --resume 起的进程**并发写同一个 run 目录**（rounds.jsonl 出现重复的
+              // round_end、state.json 互相覆盖）。必须整棵进程树杀：taskkill /T。
               await shell.run(shell.resolve({
-                command: 'Stop-Process -Id ' + pid + ' -Force -ErrorAction SilentlyContinue',
-                timeoutMs: 20000,
+                command: 'taskkill /F /T /PID ' + pid + ' | Out-Null; ' +
+                         'Stop-Process -Id ' + pid + ' -Force -ErrorAction SilentlyContinue; exit 0',
+                timeoutMs: 30000,
                 sandboxPolicy: { mode: 'workspace-write', workspaceRoot: COUNCIL_DIR },
               }))
             }
@@ -246,11 +252,11 @@ export default {
           if (!task) throw new Error('task 不能为空')
           const tier = ['fast', 'standard', 'deep'].includes(args.tier) ? args.tier : 'standard'
           const mode = args.mode === 'inline' ? 'inline' : 'report'
-          // v15.12：timeoutMs 现在只是**轮询 deadline**，不再是 shell 调用超时——
-          // 因此不受 dsh-pwsh-local 的 maxTimeoutMs(600s) 钳制。python 自身有墙钟预算
-          // 自限（wallBudget + 综合落盘），这里留足余量。report/inline 走的是同一个
-          // 收敛循环、耗时相同，所以两者用同一 deadline（旧的 inline=300s 是错的）。
-          const timeoutMs = 2700000
+          // v15.13（2026-09-14 Robert 拍板取消墙钟）：这个 deadline 现在必须 >=
+          // council-params.json 的 wallBudget.hostTimeoutS(12600s)，否则插件轮询会先超时，
+          // 把"墙钟"从 python 挪到这里，等于没取消。python 侧现在只在 runawayGuardS
+          // (10800s) 才兜底，正常 run 由增长枯竭判据自然结束（通常 3-6 轮 / 30-60 分钟）。
+          const timeoutMs = 12600000
           const runRes = await runLongChecked(
             py('council_v14.py', '--task', task, '--tier', tier, '--mode', mode),
             COUNCIL_DIR, timeoutMs, 'council python')
@@ -1153,7 +1159,7 @@ export default {
           try {
             // v15.12：同 run_council 工具——走分离启动 + 轮询，绕开 600s 钳制
             const hcmd = py('council_v14.py', '--task', task, '--tier', tier, '--mode', mode)
-            const hres = await runLongChecked(hcmd, COUNCIL_DIR, 2700000, 'council python')
+            const hres = await runLongChecked(hcmd, COUNCIL_DIR, 12600000, 'council python')
             assertExitOk(hres, 'council python')
             return sendJson(res, 200, { ok: true })
           } catch (e) {
